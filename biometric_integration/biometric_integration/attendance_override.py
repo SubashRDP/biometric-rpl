@@ -262,37 +262,6 @@ def adjust_out_time(doc, method=None):
 
 # Automatically submit attendance if present full time 
 
-def update_out_time_from_checkin(doc, method=None):
-	"""
-	When an OUT checkin is inserted and attendance already exists for that employee+date,
-	update out_time on the attendance record and link the checkin to it.
-	This handles the race condition where the scheduler creates attendance before the OUT punch arrives.
-	"""
-	if doc.log_type != "OUT":
-		return
-
-	try:
-		attendance_date = getdate(doc.time)
-		attendance = frappe.db.get_value(
-			"Attendance",
-			{"employee": doc.employee, "attendance_date": attendance_date, "docstatus": ("!=", 2)},
-			["name", "docstatus"],
-			as_dict=True,
-		)
-		if not attendance:
-			return
-
-		frappe.db.set_value("Attendance", attendance.name, "out_time", doc.time)
-		frappe.db.set_value("Employee Checkin", doc.name, "attendance", attendance.name)
-
-		frappe.logger("biometric").info(
-			f"Linked OUT checkin {doc.name} to attendance {attendance.name}, out_time={doc.time}"
-		)
-
-	except Exception:
-		frappe.log_error(frappe.get_traceback(), "update_out_time_from_checkin Failed")
-
-
 def auto_submit_attendance(doc, method=None):
 	"""
 	Auto-submit Attendance if out_time >= shift end_time.

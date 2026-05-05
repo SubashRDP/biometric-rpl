@@ -141,9 +141,7 @@ fixtures = ["Custom Field"]
 
 
 doc_events = {
-    "Employee Checkin": {
-        "after_insert": "biometric_integration.biometric_integration.attendance_override.update_out_time_from_checkin"
-    },
+
     "Attendance": {
         "before_save": [
             "biometric_integration.biometric_integration.attendance_override.set_shift_deviation_fields",
