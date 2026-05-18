@@ -1,3 +1,5 @@
 pyzk
 requests
 pyinstaller
+pystray
+Pillow

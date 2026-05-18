@@ -11,8 +11,11 @@ import json
 import logging
 import logging.handlers
 import os
+import platform
 import socket
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 from datetime import date, datetime
@@ -21,6 +24,16 @@ from tkinter.scrolledtext import ScrolledText
 
 import requests
 from zk import ZK
+
+try:
+    import pystray
+    from PIL import Image, ImageDraw
+    HAS_TRAY = True
+except ImportError:
+    HAS_TRAY = False
+
+IS_WINDOWS = platform.system() == "Windows"
+TASK_NAME = "K40 Bridge"
 
 # ============================================
 # CONSTANTS
@@ -33,6 +46,7 @@ WEBHOOK_PATH = (
 APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 SYNCED_RECORDS_FILE = os.path.join(APP_DIR, "k40_synced.json")
+NEXT_SYNC_FILE = os.path.join(APP_DIR, "next_sync.json")
 LOG_FILE = os.path.join(APP_DIR, "k40_bridge.log")
 
 DEFAULT_CONFIG = {
@@ -54,6 +68,122 @@ INTERVAL_OPTIONS = [
     ("5 minutes", 5),
     ("2 minutes", 2),
 ]
+
+
+# ============================================
+# WINDOWS AUTO-START (Task Scheduler integration)
+# ============================================
+def _is_admin():
+    if not IS_WINDOWS:
+        return False
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def autostart_status():
+    """Return True if the K40 Bridge scheduled task exists."""
+    if not IS_WINDOWS:
+        return False
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Query", "/TN", TASK_NAME],
+            capture_output=True, text=True, timeout=5,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def autostart_install():
+    """Register the bridge as a Windows scheduled task.
+    Auto-start at boot, restart on failure, highest privilege.
+    Returns (ok, message)."""
+    if not IS_WINDOWS:
+        return False, "Auto-start is only supported on Windows."
+    if not _is_admin():
+        return False, (
+            "Administrator rights required.\n\n"
+            "Close the bridge, then right-click k40_bridge.exe → "
+            "Run as administrator, then click Enable Auto-Start again."
+        )
+
+    exe_path = os.path.abspath(sys.argv[0])
+    work_dir = os.path.dirname(exe_path)
+
+    xml = (
+        '<?xml version="1.0" encoding="UTF-16"?>\n'
+        '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+        '  <Triggers>\n'
+        '    <BootTrigger><Enabled>true</Enabled></BootTrigger>\n'
+        '    <LogonTrigger><Enabled>true</Enabled></LogonTrigger>\n'
+        '  </Triggers>\n'
+        '  <Principals>\n'
+        '    <Principal id="Author">\n'
+        '      <RunLevel>HighestAvailable</RunLevel>\n'
+        '      <LogonType>InteractiveToken</LogonType>\n'
+        '    </Principal>\n'
+        '  </Principals>\n'
+        '  <Settings>\n'
+        '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+        '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+        '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n'
+        '    <RestartOnFailure>\n'
+        '      <Interval>PT1M</Interval>\n'
+        '      <Count>999</Count>\n'
+        '    </RestartOnFailure>\n'
+        '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+        '    <AllowHardTerminate>true</AllowHardTerminate>\n'
+        '    <StartWhenAvailable>true</StartWhenAvailable>\n'
+        '  </Settings>\n'
+        '  <Actions>\n'
+        f'    <Exec>\n'
+        f'      <Command>{exe_path}</Command>\n'
+        f'      <WorkingDirectory>{work_dir}</WorkingDirectory>\n'
+        '    </Exec>\n'
+        '  </Actions>\n'
+        '</Task>\n'
+    )
+
+    fd, xml_path = tempfile.mkstemp(suffix=".xml")
+    try:
+        os.close(fd)
+        with open(xml_path, "w", encoding="utf-16") as f:
+            f.write(xml)
+        result = subprocess.run(
+            ["schtasks", "/Create", "/XML", xml_path, "/TN", TASK_NAME, "/F"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0:
+            return True, "Auto-start enabled. Bridge will launch at every boot."
+        return False, (result.stderr or result.stdout or "Unknown error").strip()
+    except Exception as e:
+        return False, str(e)
+    finally:
+        try:
+            os.remove(xml_path)
+        except Exception:
+            pass
+
+
+def autostart_uninstall():
+    """Remove the K40 Bridge scheduled task."""
+    if not IS_WINDOWS:
+        return False, "Auto-start is only supported on Windows."
+    if not _is_admin():
+        return False, "Administrator rights required."
+    try:
+        result = subprocess.run(
+            ["schtasks", "/Delete", "/TN", TASK_NAME, "/F"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            return True, "Auto-start disabled."
+        return False, (result.stderr or result.stdout or "Unknown error").strip()
+    except Exception as e:
+        return False, str(e)
 
 
 # ============================================
@@ -303,12 +433,53 @@ class SyncEngine:
     def resume(self):
         self.paused = False
 
+    def _load_next_sync(self):
+        if not os.path.exists(NEXT_SYNC_FILE):
+            return None
+        try:
+            with open(NEXT_SYNC_FILE) as f:
+                return float(json.load(f).get("next_sync_at", 0))
+        except Exception:
+            return None
+
+    def _save_next_sync(self, ts):
+        try:
+            with open(NEXT_SYNC_FILE, "w") as f:
+                json.dump({"next_sync_at": ts, "saved_at": time.time()}, f)
+        except Exception:
+            pass
+
     def _loop(self):
-        self.run_sync()
+        interval = int(self.config.get("sync_interval_minutes", 1440)) * 60
+        saved_next = self._load_next_sync()
+        now = time.time()
+
+        # If we have a previously scheduled time and it's in the past
+        # (computer was off when sync was due) → catch up immediately.
+        # If it's in the future → resume that schedule without re-syncing.
+        # If no saved state (first run) → sync immediately.
+        if saved_next is None:
+            self.logger.info("First run — running initial sync")
+            self.run_sync()
+            self.next_sync_at = time.time() + interval
+            self._save_next_sync(self.next_sync_at)
+        elif saved_next <= now:
+            overdue_min = int((now - saved_next) / 60)
+            self.logger.info(
+                f"Catch-up sync — scheduled time was {overdue_min} min ago (computer was off?)"
+            )
+            self.run_sync()
+            self.next_sync_at = time.time() + interval
+            self._save_next_sync(self.next_sync_at)
+        else:
+            self.next_sync_at = saved_next
+            wait_min = int((saved_next - now) / 60)
+            self.logger.info(f"Resuming schedule — next sync in {wait_min} min")
+
         while not self.stop_event.is_set():
             interval = int(self.config.get("sync_interval_minutes", 1440)) * 60
-            self.next_sync_at = time.time() + interval
-            woken = self.force_event.wait(timeout=interval)
+            wait_time = max(0.0, self.next_sync_at - time.time())
+            woken = self.force_event.wait(timeout=wait_time)
             if self.stop_event.is_set():
                 break
             if woken:
@@ -316,8 +487,12 @@ class SyncEngine:
                 subset = self.force_subset
                 self.force_subset = None
                 self.run_sync(subset)
+                # Force-sync does NOT reset the scheduled time —
+                # the regular cycle stays on its rhythm.
             elif not self.paused:
                 self.run_sync()
+                self.next_sync_at = time.time() + interval
+                self._save_next_sync(self.next_sync_at)
 
     def run_sync(self, device_names=None):
         devices = self.config.get("devices", [])
@@ -617,6 +792,8 @@ class ControlPanel:
         self.engine.start()
         self._tick()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.tray_icon = None
+        self._setup_tray()
 
     def _build(self):
         top = ttk.Frame(self.root)
@@ -649,6 +826,13 @@ class ControlPanel:
         btns.pack(fill="x", padx=10, pady=4)
         ttk.Button(btns, text="Force Sync All", command=self._force_all).pack(side="left", padx=2)
         ttk.Button(btns, text="Force Sync Selected", command=self._force_selected).pack(side="left", padx=2)
+
+        # Auto-start button (Windows only)
+        if IS_WINDOWS:
+            self.autostart_btn = ttk.Button(btns, text="…", command=self._toggle_autostart)
+            self.autostart_btn.pack(side="left", padx=12)
+            self._refresh_autostart_label()
+
         ttk.Button(btns, text="Open Log Folder", command=self._open_log_folder).pack(side="right", padx=2)
 
         ttk.Label(self.root, text="Recent log:").pack(anchor="w", padx=10, pady=(6, 0))
@@ -739,6 +923,34 @@ class ControlPanel:
         else:
             os.system(f'xdg-open "{APP_DIR}"')
 
+    def _refresh_autostart_label(self):
+        if not IS_WINDOWS or not hasattr(self, "autostart_btn"):
+            return
+        if autostart_status():
+            self.autostart_btn.config(text="Auto-Start: ON")
+        else:
+            self.autostart_btn.config(text="Enable Auto-Start")
+
+    def _toggle_autostart(self):
+        if autostart_status():
+            if not messagebox.askyesno(
+                "Disable Auto-Start",
+                "Disable auto-start on Windows boot?\n\n"
+                "(The bridge will only run when you launch it manually.)",
+            ):
+                return
+            ok, msg = autostart_uninstall()
+        else:
+            ok, msg = autostart_install()
+
+        if ok:
+            messagebox.showinfo("Auto-Start", msg)
+            self.logger.info(f"Auto-start changed: {msg}")
+        else:
+            messagebox.showerror("Auto-Start", msg)
+            self.logger.warning(f"Auto-start change failed: {msg}")
+        self._refresh_autostart_label()
+
     def _tick(self):
         if self.engine.next_sync_at and not self.engine.paused:
             remaining = max(0, int(self.engine.next_sync_at - time.time()))
@@ -755,10 +967,54 @@ class ControlPanel:
             self.countdown_label.config(text="")
         self.root.after(1000, self._tick)
 
+    def _setup_tray(self):
+        """Create the system tray icon. Bridge keeps running when window is hidden."""
+        if not HAS_TRAY:
+            return
+        try:
+            img = Image.new("RGB", (64, 64), color=(40, 100, 200))
+            d = ImageDraw.Draw(img)
+            d.rectangle((10, 18, 54, 46), outline=(255, 255, 255), width=3)
+            d.text((22, 22), "K40", fill=(255, 255, 255))
+
+            menu = pystray.Menu(
+                pystray.MenuItem("Show", self._show_window, default=True),
+                pystray.MenuItem("Force Sync All", lambda: self.engine.force_sync()),
+                pystray.MenuItem("Exit", self._real_exit),
+            )
+            self.tray_icon = pystray.Icon("k40_bridge", img, "K40 Bridge", menu)
+            threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        except Exception as e:
+            self.logger.warning(f"Tray icon could not start: {e}")
+            self.tray_icon = None
+
+    def _show_window(self, *_):
+        self.root.after(0, lambda: (self.root.deiconify(), self.root.lift()))
+
     def _on_close(self):
-        if messagebox.askyesno("Exit K40 Bridge", "Stop the sync engine and exit?"):
-            self.engine.stop()
-            self.root.destroy()
+        """X button = hide to tray, bridge keeps running."""
+        if self.tray_icon:
+            self.root.withdraw()
+            self.logger.info("Window hidden to tray — bridge continues running")
+        else:
+            # No tray support — fall back to ask-before-exit behavior
+            if messagebox.askyesno(
+                "Exit K40 Bridge",
+                "Closing this window will STOP the sync engine.\n\n"
+                "Do you want to exit?",
+            ):
+                self.engine.stop()
+                self.root.destroy()
+
+    def _real_exit(self, *_):
+        """Called from tray menu — fully exits the bridge."""
+        self.engine.stop()
+        if self.tray_icon:
+            try:
+                self.tray_icon.stop()
+            except Exception:
+                pass
+        self.root.after(0, self.root.destroy)
 
     def run(self):
         self.root.mainloop()
