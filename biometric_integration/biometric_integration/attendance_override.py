@@ -2,7 +2,7 @@ import frappe
 from datetime import datetime, timedelta
 from frappe.utils import getdate, get_datetime
 from frappe.utils import get_time, get_datetime, get_traceback
-
+from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
 
 def _round_to_minute(seconds):
     """
@@ -132,7 +132,7 @@ def create_compensatory_leave_on_holiday(doc, method):
 
     try:
         # Get holiday list for the employee (Employee → Company → Global Defaults)
-        from erpnext.setup.doctype.employee.employee import get_holiday_list_for_employee
+       
         holiday_list = get_holiday_list_for_employee(doc.employee, raise_exception=False)
         if not holiday_list:
             return

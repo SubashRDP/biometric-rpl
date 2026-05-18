@@ -1,4 +1,7 @@
 app_name = "biometric_integration"
+
+# ZKTeco ADMS push protocol — devices POST to /iclock/cdata, /iclock/getrequest etc.
+page_renderer = ["biometric_integration.biometric_integration.iclock.IclockRenderer"]
 app_title = "Biometric Integration"
 app_publisher = "Dikshya"
 app_description = "Biometric Integration"
