@@ -1,7 +1,7 @@
 import frappe
 
 
-@frappe.whitelist(allow_guest=True)
+@frappe.whitelist(methods=["POST"])
 def zkteco_push_attendance(**kwargs):
     """
     Single-record endpoint called by k40_bridge.py for each punch.

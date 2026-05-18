@@ -25,7 +25,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --name k40_bridge k40_bridge/k40_bridge.py
+          pyinstaller --onefile --noconsole --name k40_bridge k40_bridge/k40_bridge.py
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
