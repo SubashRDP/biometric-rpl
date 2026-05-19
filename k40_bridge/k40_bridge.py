@@ -74,6 +74,7 @@ APP_DIR = _data_dir()
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 SYNCED_RECORDS_FILE = os.path.join(APP_DIR, "k40_synced.json")
 NEXT_SYNC_FILE = os.path.join(APP_DIR, "next_sync.json")
+LAST_SYNC_DATES_FILE = os.path.join(APP_DIR, "last_sync_dates.json")
 LOG_FILE = os.path.join(APP_DIR, "k40_bridge.log")
 
 # One-time migration: if old config sits next to the exe, copy it into APP_DIR
@@ -389,7 +390,13 @@ class ZKTecoClient(_BaseClient):
     def _default_port(self):
         return 4370
 
-    def fetch_attendance(self, date_filter=None):
+    def fetch_attendance(self, date_from=None, date_to=None):
+        """Fetch attendance records.
+
+        - date_from=None, date_to=None → return ALL records on the device.
+        - date_from set → keep records on/after that date.
+        - date_to set → keep records on/before that date.
+        """
         if not self.probe_network():
             return [], "UNREACHABLE"
 
@@ -420,8 +427,15 @@ class ZKTecoClient(_BaseClient):
                 except Exception:
                     pass
 
-            if date_filter:
-                attendances = [a for a in attendances if a.timestamp.date() == date_filter]
+            if date_from or date_to:
+                def _in_range(a):
+                    d = a.timestamp.date()
+                    if date_from and d < date_from:
+                        return False
+                    if date_to and d > date_to:
+                        return False
+                    return True
+                attendances = [a for a in attendances if _in_range(a)]
             return attendances, "OK"
         except Exception as e:
             return [], f"ERROR: {e}"
@@ -435,7 +449,7 @@ class HikvisionClient(_BaseClient):
     def _default_port(self):
         return 80
 
-    def fetch_attendance(self, date_filter=None):
+    def fetch_attendance(self, date_from=None, date_to=None):
         if not self.probe_network():
             return [], "UNREACHABLE"
 
@@ -453,15 +467,20 @@ class HikvisionClient(_BaseClient):
             scheme = "https" if port == 443 else "http"
             base = f"{scheme}://{ip}:{port}"
 
-            if date_filter is None:
-                date_filter = date.today()
+            # Default window: last 30 days → today. If no bounds passed,
+            # use a wide window since Hikvision REQUIRES a startTime/endTime.
+            today = date.today()
+            if date_from is None:
+                date_from = today.replace(year=today.year - 1) if today.month > 1 else date(today.year - 1, today.month, today.day)
+            if date_to is None:
+                date_to = today
 
             # ISO 8601 day window. Hikvision wants TZ offset; use local.
             from datetime import time as _time, timezone, timedelta
             tz_offset_sec = -time.timezone if time.daylight == 0 else -time.altzone
             tz = timezone(timedelta(seconds=tz_offset_sec))
-            start = datetime.combine(date_filter, _time.min).replace(tzinfo=tz).isoformat()
-            end = datetime.combine(date_filter, _time.max).replace(tzinfo=tz).isoformat()
+            start = datetime.combine(date_from, _time.min).replace(tzinfo=tz).isoformat()
+            end = datetime.combine(date_to, _time.max).replace(tzinfo=tz).isoformat()
 
             auth = HTTPDigestAuth(user, pw)
             records = []
@@ -621,6 +640,7 @@ class SyncEngine:
         self.stop_event = threading.Event()
         self.force_event = threading.Event()
         self.force_subset = None  # None=all, list=specific
+        self.force_from_date = None  # if set, used as date_from for the next sync
         self.thread = None
         self.last_sync_per_device = {}
         self.next_sync_at = None
@@ -634,8 +654,12 @@ class SyncEngine:
         self.stop_event.set()
         self.force_event.set()
 
-    def force_sync(self, device_names=None):
+    def force_sync(self, device_names=None, from_date=None):
+        """Trigger immediate sync.
+        device_names: list to sync only those (None = all).
+        from_date: pull records starting this date (None = use saved last_sync_date)."""
         self.force_subset = device_names
+        self.force_from_date = from_date
         self.force_event.set()
 
     def reschedule(self):
@@ -666,6 +690,34 @@ class SyncEngine:
         try:
             with open(NEXT_SYNC_FILE, "w") as f:
                 json.dump({"next_sync_at": ts, "saved_at": time.time()}, f)
+        except Exception:
+            pass
+
+    def _load_last_sync_dates(self):
+        if not os.path.exists(LAST_SYNC_DATES_FILE):
+            return {}
+        try:
+            with open(LAST_SYNC_DATES_FILE) as f:
+                return json.load(f) or {}
+        except Exception:
+            return {}
+
+    def _get_last_sync_date(self, device_name):
+        """Returns a date or None if never synced before."""
+        s = self._load_last_sync_dates().get(device_name)
+        if not s:
+            return None
+        try:
+            return datetime.strptime(s, "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+    def _set_last_sync_date(self, device_name, d):
+        dates = self._load_last_sync_dates()
+        dates[device_name] = d.strftime("%Y-%m-%d")
+        try:
+            with open(LAST_SYNC_DATES_FILE, "w") as f:
+                json.dump(dates, f, indent=2)
         except Exception:
             pass
 
@@ -715,8 +767,10 @@ class SyncEngine:
             if woken:
                 self.force_event.clear()
                 subset = self.force_subset
+                from_date = self.force_from_date
                 self.force_subset = None
-                self.run_sync(subset)
+                self.force_from_date = None
+                self.run_sync(subset, from_date_override=from_date)
                 # Force-sync does NOT reset the scheduled time —
                 # the regular cycle stays on its rhythm.
             elif not self.paused:
@@ -724,16 +778,16 @@ class SyncEngine:
                 self.next_sync_at = time.time() + interval
                 self._save_next_sync(self.next_sync_at)
 
-    def run_sync(self, device_names=None):
+    def run_sync(self, device_names=None, from_date_override=None):
         devices = self.config.get("devices", [])
         if device_names is not None:
             devices = [d for d in devices if d["name"] in device_names]
         for device in devices:
             if self.stop_event.is_set():
                 return
-            self._sync_one(device)
+            self._sync_one(device, from_date_override=from_date_override)
 
-    def _sync_one(self, device):
+    def _sync_one(self, device, from_date_override=None):
         name = device["name"]
         self.status_callback(name, "syncing", None)
         self.logger.info(f"[{name}] sync_cycle: starting")
@@ -745,7 +799,26 @@ class SyncEngine:
         )
 
         today = date.today()
-        attendances, status = client.fetch_attendance(date_filter=today)
+
+        if from_date_override is not None:
+            date_from = from_date_override
+            self.logger.info(
+                f"[{name}] manual sync from {date_from} (overriding saved last_sync_date)"
+            )
+        else:
+            last_sync_date = self._get_last_sync_date(name)
+            if last_sync_date is None:
+                self.logger.info(
+                    f"[{name}] no previous sync date — pulling ALL records from device (first run / fresh install)"
+                )
+                date_from = None  # fetch everything on device
+            else:
+                date_from = last_sync_date
+                self.logger.info(
+                    f"[{name}] last synced {last_sync_date}; fetching from that date through today"
+                )
+
+        attendances, status = client.fetch_attendance(date_from=date_from, date_to=today)
 
         if status == "UNREACHABLE":
             self.logger.warning(
@@ -797,8 +870,14 @@ class SyncEngine:
 
         self.dedup.save()
         self.last_sync_per_device[name] = datetime.now().strftime("%H:%M:%S")
+        # Save today's date as the last sync date so next cycle starts from here.
+        # Done regardless of per-record push errors — failed records remain on the
+        # device, and once the underlying issue is fixed they'll be picked up on the
+        # next pass via dedup tracking.
+        self._set_last_sync_date(name, today)
         self.logger.info(
-            f"[{name}] sync_cycle: synced={synced} skipped={skipped} errors={errors}"
+            f"[{name}] sync_cycle: synced={synced} skipped={skipped} errors={errors}; "
+            f"last_sync_date saved as {today}"
         )
 
         if errors > 0:
@@ -1047,7 +1126,8 @@ class SetupWizard:
 
         def worker():
             client = make_device_client(dev, timeout=5, retries=2)
-            records, status = client.fetch_attendance(date_filter=date.today())
+            today_ = date.today()
+            records, status = client.fetch_attendance(date_from=today_, date_to=today_)
             self.window.after(0, lambda: self._show_test_result(name, dtype, status, len(records), entries))
 
         threading.Thread(target=worker, daemon=True).start()
@@ -1205,6 +1285,7 @@ class ControlPanel:
         btns.pack(fill="x", padx=10, pady=4)
         ttk.Button(btns, text="Force Sync All", command=self._force_all).pack(side="left", padx=2)
         ttk.Button(btns, text="Force Sync Selected", command=self._force_selected).pack(side="left", padx=2)
+        ttk.Button(btns, text="Sync from Date…", command=self._sync_from_date).pack(side="left", padx=2)
 
         # Auto-start button (Windows only)
         if IS_WINDOWS:
@@ -1274,6 +1355,62 @@ class ControlPanel:
             return
         self.logger.info(f"Force Sync Selected from GUI: {list(sel)}")
         self.engine.force_sync(list(sel))
+
+    def _sync_from_date(self):
+        """Prompt for a date, then pull all records from that date forward."""
+        dlg = Toplevel(self.root)
+        dlg.title("Sync from Date")
+        dlg.geometry("420x230")
+        dlg.transient(self.root)
+        dlg.grab_set()
+
+        ttk.Label(
+            dlg,
+            text="Pull all attendance records from this date forward:",
+            wraplength=380,
+        ).pack(padx=12, pady=(12, 6))
+
+        # Default to 7 days ago — common case is "I noticed records missing recently"
+        from datetime import timedelta as _td
+        default_date = (date.today() - _td(days=7)).strftime("%Y-%m-%d")
+
+        date_var = StringVar(value=default_date)
+        ent = ttk.Entry(dlg, textvariable=date_var, width=20)
+        ent.pack(padx=12, pady=4)
+        ttk.Label(dlg, text="Format: YYYY-MM-DD", foreground="gray").pack()
+
+        sel = self.tree.selection()
+        target = "selected device(s)" if sel else "all devices"
+        ttk.Label(
+            dlg,
+            text=f"This will apply to: {target}.\n(Highlight rows before opening this dialog to limit.)",
+            foreground="gray", wraplength=380, justify="center",
+        ).pack(padx=12, pady=(6, 6))
+
+        def go():
+            s = date_var.get().strip()
+            try:
+                d = datetime.strptime(s, "%Y-%m-%d").date()
+            except ValueError:
+                messagebox.showerror("Invalid date", f"'{s}' is not a valid date.\nUse YYYY-MM-DD.")
+                return
+            if d > date.today():
+                messagebox.showerror("Invalid date", "Date is in the future.")
+                return
+            device_names = list(sel) if sel else None
+            self.logger.info(
+                f"Sync from Date triggered: from={d}, devices={device_names or 'ALL'}"
+            )
+            self.engine.force_sync(device_names=device_names, from_date=d)
+            dlg.destroy()
+
+        btns = ttk.Frame(dlg)
+        btns.pack(pady=10)
+        ttk.Button(btns, text="Sync", command=go).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cancel", command=dlg.destroy).pack(side="left", padx=4)
+
+        ent.focus_set()
+        ent.select_range(0, "end")
 
     def _toggle_pause(self):
         if self.engine.paused:
