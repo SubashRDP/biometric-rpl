@@ -43,7 +43,11 @@ UPDATE_CHECK_URL = (
     "https://raw.githubusercontent.com/SubashRDP/biometric-rpl/"
     "develop/k40_bridge/latest_version.txt"
 )
-DOWNLOAD_PAGE_URL = "https://github.com/SubashRDP/biometric-rpl/actions"
+# Direct download URL — Releases on public repos work WITHOUT GitHub login.
+DOWNLOAD_PAGE_URL = "https://github.com/SubashRDP/biometric-rpl/releases/latest"
+INSTALLER_DOWNLOAD_URL = (
+    "https://github.com/SubashRDP/biometric-rpl/releases/latest/download/K40BridgeSetup.exe"
+)
 
 def _data_dir():
     """Return a stable per-user data directory that survives exe moves/replacements."""

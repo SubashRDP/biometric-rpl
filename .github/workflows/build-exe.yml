@@ -6,6 +6,9 @@ on:
       - 'k40_bridge/**'
   workflow_dispatch:
 
+permissions:
+  contents: write  # required to create/update Releases
+
 jobs:
   build:
     runs-on: windows-latest
@@ -34,19 +37,40 @@ jobs:
 
       - name: Build Installer (Inno Setup)
         run: |
-          # Inno Setup 6 is preinstalled on windows-latest runners
           & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" k40_bridge/installer.iss
         continue-on-error: true
 
-      - name: Upload EXE
+      - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
         with:
           name: k40_bridge
           path: dist/k40_bridge.exe
 
-      - name: Upload Installer
+      - name: Upload Installer artifact
         uses: actions/upload-artifact@v4
         with:
           name: K40BridgeSetup
           path: k40_bridge/Output/K40BridgeSetup.exe
         continue-on-error: true
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(head -1 k40_bridge/latest_version.txt | tr -d '[:space:]')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Detected version: $VERSION"
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: K40 Bridge v${{ steps.version.outputs.version }}
+          body: |
+            Download `K40BridgeSetup.exe` below and run it on the Windows machine.
+            See README for setup instructions.
+          files: |
+            dist/k40_bridge.exe
+            k40_bridge/Output/K40BridgeSetup.exe
+          make_latest: 'true'
+          token: ${{ secrets.GITHUB_TOKEN }}
