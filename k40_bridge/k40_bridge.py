@@ -1,11 +1,4 @@
-#!/usr/bin/env python3
-"""
-K40 Bridge — multi-device, multi-site sync from ZKTeco K40 to ERPNext.
 
-Run: python3 k40_bridge.py        (or k40_bridge.exe on Windows)
-On first run, a setup wizard appears. Configuration is saved to config.json
-next to the executable.
-"""
 
 import json
 import logging
@@ -38,16 +31,53 @@ TASK_NAME = "K40 Bridge"
 # ============================================
 # CONSTANTS
 # ============================================
+VERSION = "1.0.0"
+
 WEBHOOK_PATH = (
     "/api/method/biometric_integration.biometric_integration."
     "biometric_integration.zkteco_push_attendance"
 )
 
-APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+def _data_dir():
+    """Return a stable per-user data directory that survives exe moves/replacements."""
+    if IS_WINDOWS:
+        base = os.environ.get("APPDATA") or os.path.expanduser("~")
+        path = os.path.join(base, "K40Bridge")
+    elif platform.system() == "Darwin":
+        path = os.path.expanduser("~/Library/Application Support/K40Bridge")
+    else:
+        path = os.path.join(
+            os.environ.get("XDG_CONFIG_HOME", os.path.expanduser("~/.config")),
+            "K40Bridge",
+        )
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+# Folder where the exe was launched (for backwards compat — old config.json was here)
+EXE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+
+# Stable per-user data directory (survives exe being moved/replaced)
+APP_DIR = _data_dir()
+
 CONFIG_FILE = os.path.join(APP_DIR, "config.json")
 SYNCED_RECORDS_FILE = os.path.join(APP_DIR, "k40_synced.json")
 NEXT_SYNC_FILE = os.path.join(APP_DIR, "next_sync.json")
 LOG_FILE = os.path.join(APP_DIR, "k40_bridge.log")
+
+# One-time migration: if old config sits next to the exe, copy it into APP_DIR
+def _migrate_old_config():
+    for fname in ("config.json", "k40_synced.json", "next_sync.json"):
+        old = os.path.join(EXE_DIR, fname)
+        new = os.path.join(APP_DIR, fname)
+        if os.path.exists(old) and not os.path.exists(new):
+            try:
+                import shutil
+                shutil.copy2(old, new)
+            except Exception:
+                pass
+
+_migrate_old_config()
 
 DEFAULT_CONFIG = {
     "sync_interval_minutes": 1440,
@@ -276,18 +306,28 @@ class DedupStore:
 
 
 # ============================================
-# DEVICE CLIENT
+# DEVICE CLIENTS
 # ============================================
-class DeviceClient:
+class _AttRecord:
+    """Lightweight record matching pyzk's Attendance shape (.user_id, .timestamp)."""
+    __slots__ = ("user_id", "timestamp")
+
+    def __init__(self, user_id, timestamp):
+        self.user_id = user_id
+        self.timestamp = timestamp
+
+
+class _BaseClient:
+    """Common probe_network + interface for device-specific clients."""
+
     def __init__(self, device, timeout=5, retries=3):
         self.device = device
         self.timeout = timeout
         self.retries = retries
 
     def probe_network(self):
-        """Fast TCP probe. Returns True if reachable on port within retries."""
         host = self.device["ip"]
-        port = int(self.device.get("port", 4370))
+        port = int(self.device.get("port", self._default_port()))
         for attempt in range(self.retries):
             try:
                 sock = socket.create_connection((host, port), timeout=self.timeout)
@@ -298,16 +338,35 @@ class DeviceClient:
                     time.sleep(min(2 ** attempt, 4))
         return False
 
+    def _default_port(self):
+        return 4370
+
     def fetch_attendance(self, date_filter=None):
-        """Pull attendance records. Returns (records, status_str)."""
+        raise NotImplementedError
+
+
+class ZKTecoClient(_BaseClient):
+    """ZK protocol over port 4370 (K20, K40, F18, MB360, eSSL, etc.)."""
+
+    def _default_port(self):
+        return 4370
+
+    def fetch_attendance(self, date_filter=None):
         if not self.probe_network():
             return [], "UNREACHABLE"
+
+        comm_key = self.device.get("comm_key", 0) or 0
+        try:
+            comm_key = int(comm_key)
+        except (TypeError, ValueError):
+            comm_key = 0
 
         try:
             conn = ZK(
                 self.device["ip"],
                 port=int(self.device.get("port", 4370)),
                 timeout=self.timeout,
+                password=comm_key,
             )
             zk = conn.connect()
             zk.disable_device()
@@ -328,6 +387,119 @@ class DeviceClient:
             return attendances, "OK"
         except Exception as e:
             return [], f"ERROR: {e}"
+
+
+class HikvisionClient(_BaseClient):
+    """Hikvision ISAPI HTTP API. Requires username/password (Digest auth).
+    Default port 80 (HTTP). Set port=443 in config and use HTTPS for secure devices.
+    """
+
+    def _default_port(self):
+        return 80
+
+    def fetch_attendance(self, date_filter=None):
+        if not self.probe_network():
+            return [], "UNREACHABLE"
+
+        try:
+            from requests.auth import HTTPDigestAuth
+            import uuid
+
+            user = self.device.get("username", "")
+            pw = self.device.get("password", "")
+            if not user:
+                return [], "ERROR: Hikvision device requires username"
+
+            ip = self.device["ip"]
+            port = int(self.device.get("port", 80))
+            scheme = "https" if port == 443 else "http"
+            base = f"{scheme}://{ip}:{port}"
+
+            if date_filter is None:
+                date_filter = date.today()
+
+            # ISO 8601 day window. Hikvision wants TZ offset; use local.
+            from datetime import time as _time, timezone, timedelta
+            tz_offset_sec = -time.timezone if time.daylight == 0 else -time.altzone
+            tz = timezone(timedelta(seconds=tz_offset_sec))
+            start = datetime.combine(date_filter, _time.min).replace(tzinfo=tz).isoformat()
+            end = datetime.combine(date_filter, _time.max).replace(tzinfo=tz).isoformat()
+
+            auth = HTTPDigestAuth(user, pw)
+            records = []
+            position = 0
+            page = 100
+            max_pages = 50  # safety cap (5000 events/day)
+
+            for _ in range(max_pages):
+                payload = {
+                    "AcsEventCond": {
+                        "searchID": str(uuid.uuid4()),
+                        "searchResultPosition": position,
+                        "maxResults": page,
+                        "major": 0,
+                        "minor": 0,
+                        "startTime": start,
+                        "endTime": end,
+                    }
+                }
+                try:
+                    r = requests.post(
+                        f"{base}/ISAPI/AccessControl/AcsEvent?format=json",
+                        json=payload, auth=auth, timeout=15, verify=False,
+                    )
+                except Exception as e:
+                    return [], f"ERROR: {e}"
+
+                if r.status_code in (401, 403):
+                    return [], "AUTH_FAIL"
+                if r.status_code != 200:
+                    return [], f"ERROR: HTTP {r.status_code}: {r.text[:160]}"
+
+                try:
+                    data = r.json()
+                except Exception:
+                    return [], f"ERROR: non-JSON response: {r.text[:160]}"
+
+                acs = data.get("AcsEvent", {})
+                events = acs.get("InfoList") or []
+                for e in events:
+                    emp = e.get("employeeNoString") or e.get("employeeNo")
+                    ts = e.get("time")
+                    if not emp or not ts:
+                        continue
+                    try:
+                        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                        # store naive local time to match pyzk shape
+                        dt = dt.replace(tzinfo=None)
+                    except Exception:
+                        continue
+                    records.append(_AttRecord(str(emp), dt))
+
+                status = (acs.get("responseStatusStrg") or "").upper()
+                if status != "MORE":
+                    break
+                position += page
+
+            return records, "OK"
+        except Exception as e:
+            return [], f"ERROR: {e}"
+
+
+DEVICE_TYPES = {
+    "zkteco": ZKTecoClient,
+    "hikvision": HikvisionClient,
+}
+
+
+def make_device_client(device, timeout=5, retries=3):
+    dtype = (device.get("type") or "zkteco").lower()
+    cls = DEVICE_TYPES.get(dtype, ZKTecoClient)
+    return cls(device, timeout=timeout, retries=retries)
+
+
+# Backwards-compat alias (old code used DeviceClient directly)
+DeviceClient = ZKTecoClient
 
 
 # ============================================
@@ -414,6 +586,7 @@ class SyncEngine:
         self.thread = None
         self.last_sync_per_device = {}
         self.next_sync_at = None
+        self.reschedule_event = threading.Event()
 
     def start(self):
         self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -426,6 +599,15 @@ class SyncEngine:
     def force_sync(self, device_names=None):
         self.force_subset = device_names
         self.force_event.set()
+
+    def reschedule(self):
+        """Called when the user changes sync_interval_minutes.
+        Wakes the sleeping thread so the new interval takes effect immediately."""
+        interval = int(self.config.get("sync_interval_minutes", 1440)) * 60
+        self.next_sync_at = time.time() + interval
+        self._save_next_sync(self.next_sync_at)
+        self.reschedule_event.set()
+        self.force_event.set()  # wakes the thread without triggering a sync
 
     def pause(self):
         self.paused = True
@@ -482,6 +664,16 @@ class SyncEngine:
             woken = self.force_event.wait(timeout=wait_time)
             if self.stop_event.is_set():
                 break
+
+            # Reschedule signal (e.g. interval changed in GUI) — don't sync, just
+            # re-evaluate the wait based on the new next_sync_at.
+            if self.reschedule_event.is_set():
+                self.reschedule_event.clear()
+                self.force_event.clear()
+                remaining = int(self.next_sync_at - time.time())
+                self.logger.info(f"Schedule updated — next sync in {remaining}s")
+                continue
+
             if woken:
                 self.force_event.clear()
                 subset = self.force_subset
@@ -508,7 +700,7 @@ class SyncEngine:
         self.status_callback(name, "syncing", None)
         self.logger.info(f"[{name}] sync_cycle: starting")
 
-        client = DeviceClient(
+        client = make_device_client(
             device,
             timeout=int(self.config.get("device_timeout_seconds", 5)),
             retries=int(self.config.get("network_probe_retries", 3)),
@@ -623,7 +815,17 @@ class SetupWizard:
         header = ttk.Frame(f2)
         header.pack(fill="x", padx=6, pady=(4, 2))
         for i, (text, width) in enumerate(
-            [("Name", 18), ("IP", 16), ("Port", 8), ("Serial", 24), ("", 4)]
+            [
+                ("Name", 14),
+                ("Type", 10),
+                ("IP", 14),
+                ("Port", 6),
+                ("Serial/ID", 16),
+                ("User", 10),
+                ("Pass / Key", 10),
+                ("Test", 7),
+                ("", 3),
+            ]
         ):
             ttk.Label(header, text=text, width=width, anchor="w").grid(row=0, column=i, padx=2)
 
@@ -676,31 +878,83 @@ class SetupWizard:
             self._add_row()
 
     def _add_row(self, device=None):
-        device = device or {"name": "", "ip": "", "port": 4370, "serial": ""}
+        device = device or {"name": "", "type": "zkteco", "ip": "", "port": 4370, "serial": ""}
         row = ttk.Frame(self.devices_frame)
         row.pack(fill="x", pady=1)
 
         entries = {}
-        for i, (key, width, default) in enumerate(
-            [
-                ("name", 18, device.get("name", "")),
-                ("ip", 16, device.get("ip", "")),
-                ("port", 8, str(device.get("port", 4370))),
-                ("serial", 24, device.get("serial", "")),
-            ]
-        ):
-            e = ttk.Entry(row, width=width)
-            e.insert(0, default)
-            e.grid(row=0, column=i, padx=2)
-            entries[key] = e
+
+        # Name
+        e = ttk.Entry(row, width=14)
+        e.insert(0, device.get("name", ""))
+        e.grid(row=0, column=0, padx=2)
+        entries["name"] = e
+
+        # Type dropdown
+        type_var = StringVar(value=device.get("type", "zkteco"))
+        type_cb = ttk.Combobox(
+            row, textvariable=type_var,
+            values=list(DEVICE_TYPES.keys()),
+            state="readonly", width=10,
+        )
+        type_cb.grid(row=0, column=1, padx=2)
+        entries["type"] = type_var
+
+        # IP
+        e = ttk.Entry(row, width=14)
+        e.insert(0, device.get("ip", ""))
+        e.grid(row=0, column=2, padx=2)
+        entries["ip"] = e
+
+        # Port
+        e = ttk.Entry(row, width=6)
+        e.insert(0, str(device.get("port", 4370)))
+        e.grid(row=0, column=3, padx=2)
+        entries["port"] = e
+
+        # Serial / Device ID
+        e = ttk.Entry(row, width=16)
+        e.insert(0, device.get("serial", ""))
+        e.grid(row=0, column=4, padx=2)
+        entries["serial"] = e
+
+        # Username (Hikvision)
+        e = ttk.Entry(row, width=10)
+        e.insert(0, device.get("username", ""))
+        e.grid(row=0, column=5, padx=2)
+        entries["username"] = e
+
+        # Password (Hikvision) / Comm Key (ZKTeco)
+        e = ttk.Entry(row, width=10, show="*")
+        e.insert(0, str(device.get("password", "") or device.get("comm_key", "")))
+        e.grid(row=0, column=6, padx=2)
+        entries["password"] = e
+
+        # Test button for this device
+        test_btn = ttk.Button(row, text="Test", width=7,
+                              command=lambda: self._test_device(entries))
+        test_btn.grid(row=0, column=7, padx=2)
+        entries["test_btn"] = test_btn
 
         def remove():
             row.destroy()
             self.device_rows[:] = [r for r in self.device_rows if r["frame"] is not row]
 
-        ttk.Button(row, text="X", width=3, command=remove).grid(row=0, column=4, padx=2)
+        ttk.Button(row, text="X", width=3, command=remove).grid(row=0, column=8, padx=2)
         entries["frame"] = row
         self.device_rows.append(entries)
+
+        # Auto-adjust port when type is changed
+        def on_type_change(*_):
+            current_port = entries["port"].get().strip()
+            if type_var.get() == "hikvision" and current_port in ("4370", ""):
+                entries["port"].delete(0, "end")
+                entries["port"].insert(0, "80")
+            elif type_var.get() == "zkteco" and current_port in ("80", "443", ""):
+                entries["port"].delete(0, "end")
+                entries["port"].insert(0, "4370")
+
+        type_var.trace_add("write", on_type_change)
 
     def _test(self):
         url = self.url_entry.get().strip()
@@ -720,6 +974,66 @@ class SetupWizard:
         else:
             self.test_label.config(text=f"● Failed: {msg[:80]}", foreground="red")
 
+    def _test_device(self, entries):
+        """Test connection to a single device row. Shows result via messagebox."""
+        name = entries["name"].get().strip() or "(unnamed)"
+        ip = entries["ip"].get().strip()
+        dtype = entries["type"].get().strip().lower() or "zkteco"
+        if not ip:
+            messagebox.showwarning("Device Test", "IP address is required.")
+            return
+
+        try:
+            port = int(entries["port"].get().strip() or (80 if dtype == "hikvision" else 4370))
+        except ValueError:
+            port = 80 if dtype == "hikvision" else 4370
+
+        # Build a temporary device dict
+        dev = {
+            "name": name,
+            "type": dtype,
+            "ip": ip,
+            "port": port,
+            "serial": entries["serial"].get().strip(),
+            "username": entries["username"].get().strip(),
+            "password": entries["password"].get().strip(),
+        }
+        if dtype == "zkteco":
+            try:
+                dev["comm_key"] = int(dev["password"]) if dev["password"] else 0
+            except ValueError:
+                dev["comm_key"] = 0
+
+        entries["test_btn"].config(text="...")
+        self.window.update_idletasks()
+
+        def worker():
+            client = make_device_client(dev, timeout=5, retries=2)
+            records, status = client.fetch_attendance(date_filter=date.today())
+            self.window.after(0, lambda: self._show_test_result(name, dtype, status, len(records), entries))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _show_test_result(self, name, dtype, status, count, entries):
+        entries["test_btn"].config(text="Test")
+        if status == "OK":
+            messagebox.showinfo(
+                "Device Test",
+                f"✓ {name} ({dtype})\n\nConnected successfully.\nFound {count} record(s) for today.",
+            )
+        elif status == "UNREACHABLE":
+            messagebox.showerror(
+                "Device Test",
+                f"✗ {name}\n\nUnreachable on the network. Check IP / port / cable.",
+            )
+        elif status == "AUTH_FAIL":
+            messagebox.showerror(
+                "Device Test",
+                f"✗ {name}\n\nAuthentication failed. Check username / password / comm key.",
+            )
+        else:
+            messagebox.showerror("Device Test", f"✗ {name}\n\n{status}")
+
     def _save(self):
         url = self.url_entry.get().strip().rstrip("/")
         key = self.key_entry.get().strip()
@@ -732,27 +1046,47 @@ class SetupWizard:
         devices = []
         for r in self.device_rows:
             name = r["name"].get().strip()
+            dtype = (r["type"].get() if hasattr(r["type"], "get") else r["type"]).strip().lower() or "zkteco"
             ip = r["ip"].get().strip()
             serial = r["serial"].get().strip()
+            username = r["username"].get().strip()
+            password = r["password"].get().strip()
             try:
-                port = int(r["port"].get().strip() or 4370)
+                port = int(r["port"].get().strip() or (80 if dtype == "hikvision" else 4370))
             except ValueError:
-                port = 4370
-            if not (name and ip and serial):
+                port = 80 if dtype == "hikvision" else 4370
+
+            if not (name and ip):
                 continue
-            devices.append(
-                {
-                    "name": name,
-                    "ip": ip,
-                    "port": port,
-                    "serial": serial,
-                    "erpnext_url": url,
-                    "api_key": key,
-                    "api_secret": secret,
-                    "latitude": 27.7228,
-                    "longitude": 85.3211,
-                }
-            )
+            # Hikvision needs username; ZKTeco needs serial (for device_id on checkins)
+            if dtype == "zkteco" and not serial:
+                continue
+            if dtype == "hikvision" and not username:
+                continue
+
+            entry = {
+                "name": name,
+                "type": dtype,
+                "ip": ip,
+                "port": port,
+                "serial": serial,
+                "erpnext_url": url,
+                "api_key": key,
+                "api_secret": secret,
+                "latitude": 27.7228,
+                "longitude": 85.3211,
+            }
+            if dtype == "zkteco":
+                # ZKTeco "Password" field is the numeric Comm Key (default 0)
+                try:
+                    entry["comm_key"] = int(password) if password else 0
+                except ValueError:
+                    entry["comm_key"] = 0
+            else:
+                entry["username"] = username
+                entry["password"] = password
+
+            devices.append(entry)
 
         if not devices:
             messagebox.showerror("No devices", "Add at least one device with name, IP, and serial.")
@@ -782,7 +1116,7 @@ class ControlPanel:
     def __init__(self, config):
         self.config = config
         self.root = Tk()
-        self.root.title("K40 Bridge")
+        self.root.title(f"K40 Bridge  v{VERSION}")
         self.root.geometry("960x640")
         self.root.minsize(820, 520)
 
@@ -914,6 +1248,9 @@ class ControlPanel:
         self.engine.config = new_config
         self._populate_tree()
         self.logger.info("Configuration updated from GUI")
+        # Recompute next sync based on (possibly new) interval and wake the
+        # sleeping thread so the change is immediate, not after old timeout.
+        self.engine.reschedule()
 
     def _open_log_folder(self):
         if sys.platform == "win32":

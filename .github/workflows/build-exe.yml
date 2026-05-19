@@ -25,10 +25,28 @@ jobs:
 
       - name: Build EXE
         run: |
-          pyinstaller --onefile --noconsole --name k40_bridge k40_bridge/k40_bridge.py
+          pyinstaller --onefile --noconsole --name k40_bridge `
+            --collect-all pystray `
+            --collect-all PIL `
+            --hidden-import=pystray._win32 `
+            --hidden-import=PIL._imaging `
+            k40_bridge/k40_bridge.py
+
+      - name: Build Installer (Inno Setup)
+        run: |
+          # Inno Setup 6 is preinstalled on windows-latest runners
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" k40_bridge/installer.iss
+        continue-on-error: true
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: k40_bridge
           path: dist/k40_bridge.exe
+
+      - name: Upload Installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: K40BridgeSetup
+          path: k40_bridge/Output/K40BridgeSetup.exe
+        continue-on-error: true
