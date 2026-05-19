@@ -38,6 +38,13 @@ WEBHOOK_PATH = (
     "biometric_integration.zkteco_push_attendance"
 )
 
+# URL to the version-tracker file in the repo. Bumped on each release.
+UPDATE_CHECK_URL = (
+    "https://raw.githubusercontent.com/SubashRDP/biometric-rpl/"
+    "develop/k40_bridge/latest_version.txt"
+)
+DOWNLOAD_PAGE_URL = "https://github.com/SubashRDP/biometric-rpl/actions"
+
 def _data_dir():
     """Return a stable per-user data directory that survives exe moves/replacements."""
     if IS_WINDOWS:
@@ -214,6 +221,33 @@ def autostart_uninstall():
         return False, (result.stderr or result.stdout or "Unknown error").strip()
     except Exception as e:
         return False, str(e)
+
+
+# ============================================
+# UPDATE CHECK
+# ============================================
+def _version_tuple(s):
+    """Convert '1.2.3' → (1, 2, 3) for comparison."""
+    try:
+        return tuple(int(x) for x in s.strip().lstrip("v").split("."))
+    except Exception:
+        return (0,)
+
+
+def check_for_update():
+    """Fetch latest version string from GitHub. Returns (latest, is_newer).
+    Returns (None, False) on failure (no network, etc.)."""
+    try:
+        r = requests.get(UPDATE_CHECK_URL, timeout=8)
+        if r.status_code != 200:
+            return None, False
+        latest = r.text.strip().split("\n")[0].strip()
+        if not latest:
+            return None, False
+        is_newer = _version_tuple(latest) > _version_tuple(VERSION)
+        return latest, is_newer
+    except Exception:
+        return None, False
 
 
 # ============================================
@@ -1128,6 +1162,8 @@ class ControlPanel:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.tray_icon = None
         self._setup_tray()
+        # Run update check in background; popup notification if newer version exists
+        threading.Thread(target=self._check_update_quiet, daemon=True).start()
 
     def _build(self):
         top = ttk.Frame(self.root)
@@ -1138,9 +1174,14 @@ class ControlPanel:
         self.countdown_label = ttk.Label(top, text="")
         self.countdown_label.pack(side="left", padx=12)
 
+        self.update_label = ttk.Label(top, text="", foreground="blue", cursor="hand2")
+        self.update_label.pack(side="left", padx=12)
+        self.update_label.bind("<Button-1>", lambda e: self._open_download_page())
+
         self.pause_btn = ttk.Button(top, text="Pause", command=self._toggle_pause)
         self.pause_btn.pack(side="right", padx=2)
         ttk.Button(top, text="Edit Config", command=self._edit_config).pack(side="right", padx=2)
+        ttk.Button(top, text="Check Updates", command=self._check_update_manual).pack(side="right", padx=2)
 
         cols = ("name", "ip", "last_sync", "status")
         self.tree = ttk.Treeview(self.root, columns=cols, show="headings", height=10)
@@ -1259,6 +1300,47 @@ class ControlPanel:
             os.system(f'open "{APP_DIR}"')
         else:
             os.system(f'xdg-open "{APP_DIR}"')
+
+    def _open_download_page(self):
+        import webbrowser
+        webbrowser.open(DOWNLOAD_PAGE_URL)
+
+    def _check_update_quiet(self):
+        """Run on startup. Show banner only if newer version exists."""
+        latest, newer = check_for_update()
+        if newer:
+            self.root.after(0, lambda: self.update_label.config(
+                text=f"⬆ Update available: v{latest} (click to download)"
+            ))
+            self.logger.info(f"Update available: v{latest} (running v{VERSION})")
+
+    def _check_update_manual(self):
+        """Manual 'Check Updates' button — always shows result."""
+        self.update_label.config(text="Checking…", foreground="gray")
+        self.root.update_idletasks()
+
+        def worker():
+            latest, newer = check_for_update()
+            def show():
+                if latest is None:
+                    self.update_label.config(text="", foreground="blue")
+                    messagebox.showwarning("Check Updates", "Could not reach update server.")
+                elif newer:
+                    self.update_label.config(
+                        text=f"⬆ Update available: v{latest} (click to download)",
+                        foreground="blue",
+                    )
+                    if messagebox.askyesno(
+                        "Update Available",
+                        f"A newer version is available.\n\nCurrent: v{VERSION}\nLatest:  v{latest}\n\nOpen the download page now?",
+                    ):
+                        self._open_download_page()
+                else:
+                    self.update_label.config(text=f"✓ Up to date (v{VERSION})", foreground="green")
+                    messagebox.showinfo("Check Updates", f"You're running the latest version (v{VERSION}).")
+            self.root.after(0, show)
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def _refresh_autostart_label(self):
         if not IS_WINDOWS or not hasattr(self, "autostart_btn"):
